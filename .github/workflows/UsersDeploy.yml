@@ -1,0 +1,76 @@
+name: Deploy Users Service
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v2
+        with:
+          dotnet-version: '8.0.101'
+
+      - name: Restore dependencies
+        run: dotnet restore ./Users.csproj
+
+      - name: Build
+        run: dotnet build --configuration Release ./Users.csproj
+
+      - name: Publish
+        run: dotnet publish Users.csproj -c Release -r linux-x64 --self-contained -o ./publish/Users
+
+      - name: Package Deployment Bundle
+        run: |
+          cd ./publish/Users
+          zip -r ../../Users-deployment.zip *
+
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y awscli
+
+      - name: Add SSH key
+        run: |
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > private_key.pem
+          chmod 600 private_key.pem
+
+      - name: Transfer Deployment Package to EC2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: 'us-east-2'
+        run: |
+          aws ec2 describe-instances --region us-east-2 --filters "Name=tag:Name,Values=Vehicles-Instance" --query "Reservations[*].Instances[*].PublicIpAddress" --output text --debug > ec2-ip.txt
+          scp -o StrictHostKeyChecking=no -i private_key.pem ./Users-deployment.zip ubuntu@$(cat ec2-ip.txt):/home/ubuntu/
+
+      - name: Stop and Kill Existing Process
+        run: |
+          ssh -i private_key.pem -o StrictHostKeyChecking=no ubuntu@$(cat ec2-ip.txt) << 'EOF'
+          #Stop the Service
+          sudo systemctl stop users.service
+          # Check for any running instance and kill it
+          PID=$(lsof -t -i:6000)
+          if [ -n "$PID" ]; then
+            echo "Killing process $PID"
+            kill -9 $PID
+          fi
+          EOF
+
+      - name: Deploy and Start Service on EC2
+        run: |
+          ssh -i private_key.pem -o StrictHostKeyChecking=no ubuntu@$(cat ec2-ip.txt) << 'EOF'
+          rm -rf /home/ubuntu/Users
+          # Unzip the deployment package
+          unzip -o /home/ubuntu/Users-deployment.zip -d /home/ubuntu/Users/      
+          # Restart the service
+          sudo systemctl start users.service
+          rm -rf Users-deployment.zip
+          EOF
